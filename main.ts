@@ -1,134 +1,135 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile } from 'obsidian';
+import { Trie } from './Trie';
+import { InteractiveTrie } from './InteractiveTrie';
 
-// Remember to rename these classes and interfaces!
-
-interface MyPluginSettings {
-	mySetting: string;
-}
-
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class LinkForge extends Plugin {
+	private pageLinks: Map<string, string>;
+	private isReplacing: boolean = false;
+	private trie: InteractiveTrie;
 
 	async onload() {
-		await this.loadSettings();
+		console.log('Loading LinkForge plugin');
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		// Initialize the pageLinks map
+		this.pageLinks = new Map<string, string>();
+
+		this.trie = new InteractiveTrie();
+
+		// Populate the pageLinks map with existing page titles
+		await this.initializePageLinks();
+
+		// Register the event listener for text input
+		this.registerEvent(
+			this.app.workspace.on('editor-change', this.onEditorChange.bind(this))
+		);
+
+		this.registerDomEvent(document, 'keydown', this.onKeyDown.bind(this));
+
+
+		// Register the event listener for page open or tab switch
+		this.registerEvent(
+			this.app.workspace.on('active-leaf-change', this.onPageOpen.bind(this))
+		);
+	}
+
+	async initializePageLinks() {
+		const files = this.app.vault.getMarkdownFiles();
+		files.forEach((file) => {
+			const fileName = file.basename;
+			this.trie.insert(fileName);
 		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+	}
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+	replaceLinks(str: string) {
+		var newStr = "";
+		var brackets = 0;
+		var currentWord = "";
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
+		str.split('').forEach((char, index) => {
+
+			if (this.trie.isCurrentEndOfWord() && brackets < 2 && !(str.length > index + 1 && !str[index + 1].match(/[a-zA-Z0-9]/))) {
+				newStr = newStr.slice(0, -currentWord.length);
+				newStr += `[[${currentWord}]]`;
+				newStr += char;
 			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
+			else {
+				newStr += char;
 			}
+
+
+			if (brackets == 1 && char != '[' && char != ']') {
+				brackets = 0;
+			}
+			if (char === '[') {
+				brackets++;
+			}
+			else if (char === ']') {
+				brackets--;
+			}
+
+			currentWord = this.trie.insertChar(char);
 		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
+
+		return newStr;
+	}
+
+	onEditorChange(editor: any, markdownView: MarkdownView) {
+		// Avoid recursive replacements
+		if (this.isReplacing) return;
+
+
+		const cursor = editor.getCursor();
+		const line = editor.getLine(cursor.line);
+
+		this.trie.reset();
+
+		const newLine = this.replaceLinks(line);
+		if (newLine !== line) {
+			editor.setLine(cursor.line, newLine);
+		}
+	}
+
+	onKeyDown(event: KeyboardEvent) {
+		if (event.key === 'Enter') {
+			const activeLeaf = this.app.workspace.activeLeaf;
+			if (activeLeaf) {
+				const view = activeLeaf.view;
+				if (view instanceof MarkdownView) {
+					const editor = view.editor;
+					const cursor = editor.getCursor();
+					if (cursor.line > 0) { // Ensure we are not at the first line
+						const previousLineText = editor.getLine(cursor.line - 1);
+						this.trie.reset();
+
+						var newLine = this.replaceLinks(previousLineText + " ");
+						newLine = newLine.slice(0, -1); // Remove the extra space added
+						if (newLine !== previousLineText) {
+							editor.setLine(cursor.line - 1, newLine);
+						}
 					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
 				}
 			}
-		});
+		}
+	}
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+	async onPageOpen() {
+		await this.initializePageLinks();
+		const file = this.app.workspace.getActiveFile();
+		if (file) {
+			const fileContent = await this.app.vault.read(file);
+			this.replacePageTitlesWithLinks(file, fileContent);
+		}
+	}
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
+	async replacePageTitlesWithLinks(file: TFile, content: string) {
+		this.trie.reset();
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		const updatedContent = this.replaceLinks(content);
+
+		await this.app.vault.modify(file, updatedContent);
 	}
 
 	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
-
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
-
-	display(): void {
-		const {containerEl} = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
+		console.log('Unloading LinkForge plugin');
 	}
 }
